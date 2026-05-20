@@ -1,11 +1,9 @@
 # Insight Healthcare — AI Service (Python FastAPI + OpenAI Agents SDK)
 #
-# Image is a placeholder pointing at GHCR. Other CallSphere apps run code
-# directly off the host via a hostPath volume (no image build/push). To swap:
-#   1. Replace `image:` with a generic Python base (e.g. python:3.11-slim)
-#   2. Mount /home/ubuntu/apps/insight_healthcare/ai-service into /app
-#   3. Override `command:` to install deps + run `uvicorn app.main:app ...`
-# Either way, the env wiring below (secrets + configmap) is identical.
+# Runs the source directly off the host via a hostPath volume — same
+# pattern as other CallSphere apps (hotel_management, prepsphere, etc.).
+# No image build/push required: code changes on disk + a pod restart
+# (or uvicorn's --reload) pick up immediately.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,14 +24,56 @@ spec:
         app: insight-healthcare
         component: ai
     spec:
+      # initContainer installs Python deps and runs Alembic migrations
+      # against the central Postgres before the main container starts.
+      initContainers:
+        - name: install-and-migrate
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir -r requirements.txt
+              alembic upgrade head
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: insight-app-secrets
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: ai-source
+              mountPath: /app
       containers:
         - name: insight-ai
-          image: ghcr.io/shankasf/insight-ai:latest
-          imagePullPolicy: Always
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              pip install --no-cache-dir -r requirements.txt
+              exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
           ports:
             - name: http
               containerPort: 8000
           env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -54,13 +94,13 @@ spec:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 10
+            initialDelaySeconds: 30
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 30
           resources:
             requests:
@@ -69,3 +109,11 @@ spec:
             limits:
               cpu: "1000m"
               memory: "1Gi"
+          volumeMounts:
+            - name: ai-source
+              mountPath: /app
+      volumes:
+        - name: ai-source
+          hostPath:
+            path: /home/ubuntu/apps/insight_healthcare/ai-service
+            type: Directory
