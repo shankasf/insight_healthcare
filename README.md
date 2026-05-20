@@ -217,15 +217,15 @@ npm run dev
 
 - [x] Plan + flowchart
 - [x] DB schema + ERD
-- [ ] Create logical DB `insight_healthcare` on central Postgres, enable `pgcrypto` + `vector`
-- [ ] Scaffold FastAPI AI service (models, repositories, agents, tools)
-- [ ] Alembic `001_init` migration + seed scripts
-- [ ] Scaffold Next.js frontend
-- [ ] Implement Triage + 3 sub-agents (OpenAI Agents SDK, GPT-5)
-- [ ] Wire frontend → Next.js API → Python service
-- [ ] k3s manifests + `insight-app-secrets`
-- [ ] DNS via Hostinger → `clinic.callsphere.site`
-- [ ] Smoke test in browser
+- [x] Create logical DB `insight_healthcare` on central Postgres, enable `pgcrypto` + `vector`
+- [x] Scaffold FastAPI AI service (models, repositories, agents, tools)
+- [x] Alembic `001_init` migration + seed scripts
+- [x] Scaffold Next.js frontend
+- [x] Implement Triage + 3 sub-agents (OpenAI Agents SDK, GPT-5)
+- [x] Wire frontend → Next.js API → Python service
+- [x] k3s manifests + `insight-app-secrets` (hostPath pattern, no image build needed)
+- [x] DNS via Hostinger → `clinic.callsphere.site`
+- [x] Smoke test (all 4 agent paths + analytics + TLS) — **LIVE 2026-05-20** ✅
 
 ---
 
