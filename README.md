@@ -306,6 +306,18 @@ erDiagram
         timestamptz created_at
         timestamptz updated_at
     }
+    insurance_member_samples {
+        uuid id PK
+        uuid plan_id FK
+        text member_id "UK"
+        text member_name
+        boolean coverage_active
+        numeric copay_amount
+        date effective_from
+        date effective_to
+        text notes
+        timestamptz created_at
+    }
     clinic_faqs {
         uuid id PK
         text question
@@ -339,6 +351,7 @@ erDiagram
 
     providers ||--o{ appointment_slots : "owns"
     appointment_slots ||--o| appointments : "booked as (1:0..1)"
+    insurance_plans ||--o{ insurance_member_samples : "covers"
     chat_sessions ||--o{ chat_events : "produces"
 ```
 
@@ -351,6 +364,7 @@ erDiagram
 | `appointment_slots` | Pre-generated bookable windows per provider. | List available (status='available' AND start_at>now); update on book. |
 | `appointments` | Confirmed bookings. `slot_id UNIQUE` prevents double-book at DB level. | Insert on confirm; read by future admin view. |
 | `insurance_plans` | Accepted (or explicitly not accepted) payers/plans + effective dates. | Case-insensitive lookup by payer_name. |
+| `insurance_member_samples` | **Demo only** — sample member IDs the Insurance agent can "verify" so the chatbot has real-looking responses out of the box. | Lookup by member_id. |
 | `clinic_faqs` | Knowledge base w/ 1536-d embeddings for semantic search. | `ORDER BY embedding <=> query_embedding LIMIT 5` from Knowledge agent. |
 | `chat_sessions` | Anonymous session tracking via cookie token. **No content.** | Upsert on each request. |
 | `chat_events` | Per-turn analytics. **No content stored.** | Insert on every agent reply; rollups by `created_at`. |
@@ -380,10 +394,11 @@ erDiagram
 
 | Revision | Contents |
 |---|---|
-| `001_init` | `CREATE EXTENSION pgcrypto, vector;` + all 8 tables + indexes |
-| `002_seed_clinic_settings` | Insert singleton row (placeholder name/address — overwrite via seed script) |
-| `003_seed_insurance_plans` | Common US payers (BCBS, Aetna, UnitedHealth, Cigna, Kaiser, Medicare) |
-| `004_seed_clinic_faqs` | ~20 starter FAQs (hours, parking, services, etc.) — embeddings filled by `scripts/embed_faqs.py` post-deploy |
+| `001_init` | `CREATE EXTENSION pgcrypto, vector;` + all 9 tables + indexes |
+| `002_seed_static` | Singleton `clinic_settings`, 3 providers, 1 `insurance_plans` row, 3 `insurance_member_samples`, 15 `clinic_faqs` rows (without embeddings) |
+| `003_generate_slots` | Generates ~420 `appointment_slots` for the next 14 weekdays (relative to migration run-time), blocks 12:00–13:00 lunch, flips 3 sample slots to `'booked'` and inserts matching `appointments` rows |
+
+A post-migration script `scripts/embed_faqs.py` fills `clinic_faqs.embedding` via OpenAI `text-embedding-3-small` once `OPENAI_API_KEY` is available in the pod env.
 
 ### 8.6 How the agents touch the DB
 
@@ -391,6 +406,101 @@ erDiagram
 |---|---|---|
 | Triage | — | — (pure routing) |
 | Appointment | `providers`, `appointment_slots` | `appointments` (insert), `appointment_slots.status` (update to 'booked' / 'available' on cancel) |
-| Insurance | `insurance_plans` | — |
+| Insurance | `insurance_plans`, `insurance_member_samples` | — |
 | Knowledge | `clinic_settings`, `clinic_faqs` (vector search) | — |
 | *(chat_service)* | `chat_sessions` (upsert) | `chat_sessions`, `chat_events` (analytics) |
+
+---
+
+## 8.7 Sample seed data
+
+Every table that needs starter content has a deterministic seed so the bot can actually answer real-sounding questions from minute one. Loaded by `python -m scripts.seed_clinic` after `alembic upgrade head`.
+
+### clinic_settings (1 row — singleton)
+
+| Field | Value |
+|---|---|
+| name | Insight Healthcare Clinic |
+| address_line1 | 123 Wellness Way, Suite 200 |
+| city / state / postal | Springfield, IL 62701 |
+| phone | (555) 555-0100 |
+| email | hello@insighthealth.example |
+| timezone | America/Chicago |
+| hours_json | Mon–Fri 09:00–17:00, Sat/Sun closed |
+| services_offered | Annual physicals, Sick visits, Immunizations, Chronic disease management, Wellness screenings, Telehealth, Basic lab work |
+
+### providers (3 rows — single specialty: Family Medicine)
+
+| name | role | email | active |
+|---|---|---|---|
+| Dr. Sarah Chen | Family Medicine | s.chen@insighthealth.example | true |
+| Dr. Marcus Thompson | Family Medicine | m.thompson@insighthealth.example | true |
+| Dr. Priya Patel | Family Medicine | p.patel@insighthealth.example | true |
+
+### appointment_slots (~420 rows total)
+
+Generator rule (run by seed script):
+- For each of 3 providers
+- For each of the next 14 calendar days (skip Sat/Sun)
+- 30-minute slots from **09:00–17:00**
+- Slots at **12:00–13:00** seeded as `status = 'blocked'` (lunch)
+- All other future slots seeded as `status = 'available'`
+- 3 specific slots flipped to `status = 'booked'` (see appointments below)
+
+Approx 10 weekday days × 14 slots × 3 providers ≈ **420 rows**.
+
+### appointments (3 sample bookings — to show "booked" state)
+
+| slot | patient_name | patient_email | reason | status |
+|---|---|---|---|---|
+| Dr. Chen, **tomorrow 10:00** | John Doe | john.doe@example.com | Annual physical | scheduled |
+| Dr. Thompson, **day-after-tomorrow 14:00** | Jane Smith | jane.smith@example.com | Diabetes follow-up | scheduled |
+| Dr. Patel, **+5 days 11:30** | Bob Johnson | bob.j@example.com | Sore throat — sick visit | scheduled |
+
+The matching `appointment_slots.status` flips to `'booked'`.
+
+### insurance_plans (1 row — the one we accept)
+
+| payer_name | plan_name | accepted | notes |
+|---|---|---|---|
+| Blue Cross Blue Shield | PPO | true | In-network. Most BCBS PPO plans accepted; bring card at first visit. |
+
+### insurance_member_samples (3 rows — demo member IDs)
+
+| plan | member_id | member_name | coverage_active | copay | notes |
+|---|---|---|---|---|---|
+| BCBS PPO | `BCBS-X10001` | John Doe | true | $25 | Standard PPO Gold |
+| BCBS PPO | `BCBS-X10002` | Jane Smith | true | $40 | High-deductible PPO |
+| BCBS PPO | `BCBS-X10003` | Bob Johnson | **false** | — | Coverage ended 2025-12-31 (expired) |
+
+The Insurance agent's `verify_member_id(member_id)` tool reads this table — so a user can ask *"is BCBS-X10003 still covered?"* and get a real, deterministic answer.
+
+### clinic_faqs (15 rows — embeddings generated by `scripts/embed_faqs.py`)
+
+| # | Question | Answer (summary) |
+|---|---|---|
+| 1 | What are your hours? | Mon–Fri 9:00 AM – 5:00 PM. Closed Sat/Sun. |
+| 2 | Where are you located? | 123 Wellness Way, Suite 200, Springfield, IL 62701. |
+| 3 | Is parking available? | Free on-site lot, accessible spots near entrance. |
+| 4 | What services do you offer? | Family medicine: physicals, sick visits, immunizations, chronic-disease management, wellness screenings. |
+| 5 | Do you treat children? | Yes, ages 6 months and up. |
+| 6 | Do you offer telehealth? | Yes, Mon–Fri 10 AM – 3 PM. |
+| 7 | What insurance do you accept? | Blue Cross Blue Shield PPO. Other plans on a case-by-case basis. |
+| 8 | How do I book an appointment? | Use this chatbot, or call (555) 555-0100. |
+| 9 | How do I reschedule or cancel? | Through this chatbot, or call us — at least 24 h notice preferred. |
+| 10 | What should I bring to my first visit? | Photo ID, insurance card, list of current medications, prior records if any. |
+| 11 | What if I'm running late? | Please call. More than 15 min late may require rescheduling. |
+| 12 | Do you do lab work on-site? | Yes — basic blood draws and urinalysis. |
+| 13 | Can I see the same provider every time? | Yes — request your provider when booking. |
+| 14 | How long is a typical visit? | 30 min routine, 45 min for new patients. |
+| 15 | How do I get a prescription refill? | Have your pharmacy fax/e-request us; we respond within 24 business hours. |
+
+### chat_sessions / chat_events (empty at seed time)
+
+Populated at runtime as users chat. Seed leaves them empty.
+
+### Determinism + idempotency
+
+- Seed uses **fixed UUIDs** for providers and the clinic settings row so re-running `seed_clinic` is idempotent (`ON CONFLICT DO UPDATE`).
+- Slot timestamps are computed relative to *seed-run date* — so the demo always has "tomorrow 10:00" as a real future slot, never a stale fixed date.
+- FAQ embeddings are filled by a separate `scripts/embed_faqs.py` pass so the seed script itself doesn't need network access to OpenAI.
