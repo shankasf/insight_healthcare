@@ -504,3 +504,70 @@ Populated at runtime as users chat. Seed leaves them empty.
 - Seed uses **fixed UUIDs** for providers and the clinic settings row so re-running `seed_clinic` is idempotent (`ON CONFLICT DO UPDATE`).
 - Slot timestamps are computed relative to *seed-run date* — so the demo always has "tomorrow 10:00" as a real future slot, never a stale fixed date.
 - FAQ embeddings are filled by a separate `scripts/embed_faqs.py` pass so the seed script itself doesn't need network access to OpenAI.
+
+---
+
+## 9. Live agent telemetry
+
+Numbers below are a **real snapshot** of the live `chat_events` analytics table (taken **2026-05-20 ~23:43 UTC**, ~3 h after go-live). Re-run the SQL below to refresh.
+
+### 9.1 Agent usage rollup (all-time across all sessions)
+
+| Agent | Turns | Avg latency | In tokens | Out tokens | Tool calls |
+|---|---:|---:|---:|---:|---:|
+| **appointment** | 37 | 13.4 s | 177,468 | 20,680 | 21 |
+| **out_of_scope** | 20 | 2.0 s | 4,927 | 1,435 | 0 |
+| **insurance** | 13 | 9.1 s | 55,810 | 5,008 | 9 |
+| **knowledge** | 12 | 9.9 s | 33,088 | 5,084 | 13 |
+| **triage** | 11 | 2.9 s | 11,586 | 1,141 | 0 |
+
+**Totals**: 93 turns · 46 unique sessions · 43 tool calls · 316,227 tokens
+
+Observations:
+- Appointment is by far the busiest specialist — matches the product's primary use case.
+- `out_of_scope` + `triage` are both fast (~2–3s) and use no tools — they're short refusals or pure routing.
+- Specialist agents that hit tools (appointment / insurance / knowledge) cluster around 9–13 s — dominated by the GPT-5 reasoning step, not the DB calls (tools themselves finish in 5–50 ms; see `tool_done latency_ms=` lines in pod stdout).
+
+### 9.2 Last 10 turns (rolling)
+
+| id | session | agent | tools | lat ms | in / out tok | UTC |
+|---|---|---|---:|---:|---:|---|
+| 93 | `8c43ebc0…` | knowledge | 1 | 8,199 | 3,935 / 417 | 23:43:01 |
+| 92 | `8c43ebc0…` | insurance | 1 | 16,808 | 2,890 / 377 | 23:41:04 |
+| 91 | `8c43ebc0…` | insurance | 0 | 4,029 | 1,542 / 219 | 23:40:47 |
+| 90 | `8c43ebc0…` | triage | 0 | 1,262 | 822 / 90 | 23:40:32 |
+| 89 | `final-e2e-17…` | appointment | 0 | 3,151 | 7,036 / 147 | 23:39:43 |
+| 88 | `final-e2e-17…` | appointment | 1 | 5,584 | 9,669 / 246 | 23:39:37 |
+| 87 | `final-e2e-17…` | appointment | 0 | 4,463 | 6,117 / 198 | 23:39:33 |
+| 86 | `final-e2e-17…` | appointment | 1 | 9,720 | 5,695 / 733 | 23:39:23 |
+| 85 | `final-e2e-17…` | appointment | 0 | 5,182 | 2,518 / 231 | 23:39:18 |
+| 84 | `final-e2e-17…` | knowledge | 1 | 6,798 | 2,956 / 373 | 23:39:11 |
+
+### 9.3 SQL one-liners to refresh
+
+```sql
+-- Agent usage rollup
+SELECT agent_used, COUNT(*) AS turns,
+       ROUND(AVG(latency_ms)::numeric, 0) AS avg_ms,
+       SUM(tokens_in)  AS tok_in_total,
+       SUM(tokens_out) AS tok_out_total,
+       SUM(tool_calls_count) AS tool_calls_total
+FROM chat_events
+GROUP BY agent_used ORDER BY turns DESC;
+
+-- Last 10 turns
+SELECT ce.id, LEFT(cs.session_key, 12) AS session, ce.agent_used,
+       ce.tool_calls_count AS tools, ce.latency_ms,
+       ce.tokens_in, ce.tokens_out,
+       to_char(ce.created_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS utc_time
+FROM chat_events ce JOIN chat_sessions cs ON cs.id = ce.session_id
+ORDER BY ce.created_at DESC LIMIT 10;
+
+-- Totals
+SELECT COUNT(*) AS turns, COUNT(DISTINCT session_id) AS sessions,
+       SUM(tool_calls_count) AS tool_calls,
+       SUM(tokens_in + tokens_out) AS total_tokens
+FROM chat_events;
+```
+
+> **Privacy**: `chat_events` records the agent used, latency, and token counts — **never** the message content. See section 7 (Non-goals) and section 8.3.
