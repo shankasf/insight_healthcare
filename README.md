@@ -98,7 +98,21 @@ insight_healthcare/
 │   │   ├── main.py              # FastAPI app + /chat endpoint
 │   │   ├── core/
 │   │   │   ├── config.py        # Settings (pydantic-settings) — DIP
+│   │   │   ├── db.py            # SQLAlchemy async engine + session
 │   │   │   └── logging.py
+│   │   ├── models/              # SQLAlchemy ORM models (one file per table)
+│   │   │   ├── clinic.py
+│   │   │   ├── provider.py
+│   │   │   ├── appointment.py
+│   │   │   ├── insurance.py
+│   │   │   ├── faq.py
+│   │   │   └── chat.py
+│   │   ├── repositories/        # DB access layer — DIP: agents depend on these, not raw SQL
+│   │   │   ├── slot_repo.py
+│   │   │   ├── appointment_repo.py
+│   │   │   ├── insurance_repo.py
+│   │   │   ├── faq_repo.py
+│   │   │   └── chat_repo.py
 │   │   ├── agents/
 │   │   │   ├── triage.py        # Head agent w/ handoffs
 │   │   │   ├── appointment.py
@@ -108,8 +122,16 @@ insight_healthcare/
 │   │   ├── schemas/
 │   │   │   └── chat.py          # Pydantic req/resp models
 │   │   └── services/
-│   │       └── chat_service.py  # Orchestrates Runner.run(...) — OCP
+│   │       ├── chat_service.py  # Orchestrates Runner.run(...) — OCP
+│   │       └── embedding_service.py # OpenAI embeddings for FAQ ingestion
+│   ├── alembic/                 # Migrations
+│   │   ├── env.py
+│   │   └── versions/
+│   ├── scripts/
+│   │   ├── seed_clinic.py       # Insert clinic_settings + insurance + FAQs
+│   │   └── embed_faqs.py        # Backfill FAQ embeddings via OpenAI
 │   ├── tests/
+│   ├── alembic.ini
 │   ├── requirements.txt
 │   └── pyproject.toml
 │
@@ -142,6 +164,7 @@ insight_healthcare/
 - Node.js ≥ 20
 - Python ≥ 3.11
 - An `OPENAI_API_KEY` with access to `gpt-5`
+- Postgres ≥ 14 with `pgcrypto` + `pgvector` extensions available (central VM at `72.62.162.83`, logical DB `insight_healthcare`)
 
 ### AI service
 ```bash
@@ -149,6 +172,10 @@ cd ai-service
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 export OPENAI_API_KEY=sk-...
+export DATABASE_URL=postgresql+asyncpg://postgres:<pw>@72.62.162.83:5432/insight_healthcare
+alembic upgrade head                 # create tables + extensions
+python -m scripts.seed_clinic        # one-time seed of clinic info + insurance + FAQs
+python -m scripts.embed_faqs         # generate pgvector embeddings for FAQs
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -167,26 +194,36 @@ npm run dev
 
 1. Build images (or use hostPath mount pattern like other CallSphere apps).
 2. `kubectl apply -f k8s/namespace.yaml`
-3. Create the secret with the real OpenAI key:
+3. Create the secret with the real OpenAI key + Postgres URL:
    ```bash
    kubectl create secret generic insight-app-secrets \
      -n insight-healthcare \
-     --from-literal=OPENAI_API_KEY=sk-...
+     --from-literal=OPENAI_API_KEY=sk-... \
+     --from-literal=DATABASE_URL=postgresql+asyncpg://postgres:<pw>@72.62.162.83:5432/insight_healthcare
    ```
 4. `kubectl apply -f k8s/`
-5. Point `clinic.callsphere.site` → cluster IP via the Hostinger DNS API (token already in CallSphere credential set).
-6. Verify: `curl https://clinic.callsphere.site/api/health`
+5. Run migrations once the pod is up:
+   ```bash
+   kubectl exec -n insight-healthcare deploy/insight-ai -- alembic upgrade head
+   kubectl exec -n insight-healthcare deploy/insight-ai -- python -m scripts.seed_clinic
+   kubectl exec -n insight-healthcare deploy/insight-ai -- python -m scripts.embed_faqs
+   ```
+6. Point `clinic.callsphere.site` → cluster IP via the Hostinger DNS API (token already in CallSphere credential set).
+7. Verify: `curl https://clinic.callsphere.site/api/health`
 
 ---
 
 ## 6. Roadmap
 
 - [x] Plan + flowchart
+- [x] DB schema + ERD
+- [ ] Create logical DB `insight_healthcare` on central Postgres, enable `pgcrypto` + `vector`
+- [ ] Scaffold FastAPI AI service (models, repositories, agents, tools)
+- [ ] Alembic `001_init` migration + seed scripts
 - [ ] Scaffold Next.js frontend
-- [ ] Scaffold FastAPI AI service
 - [ ] Implement Triage + 3 sub-agents (OpenAI Agents SDK, GPT-5)
 - [ ] Wire frontend → Next.js API → Python service
-- [ ] k3s manifests
+- [ ] k3s manifests + `insight-app-secrets`
 - [ ] DNS via Hostinger → `clinic.callsphere.site`
 - [ ] Smoke test in browser
 
@@ -194,7 +231,166 @@ npm run dev
 
 ## 7. Non-goals (for v1)
 
-- No login / patient identity (anonymous chat only).
-- No real EHR / scheduling integration — appointment + insurance tools return **stubbed** clinic data so the agent flow is demonstrable end-to-end. Real integrations are a follow-up.
-- No chat history persistence (stateless per request).
+- No login / patient identity for browsing — patient name/email/phone are captured *only* on the `appointments` row when a booking is actually confirmed.
+- No real EHR integration — appointments live in our own Postgres tables (a clinic admin tool can read them later).
+- **No chat content stored.** `chat_events` records which agent answered + latency + token counts, never the message text (privacy by design).
 - No streaming responses (plain JSON reply for simplicity; can upgrade to SSE later).
+
+---
+
+## 8. Database schema (Postgres)
+
+- **Host**: `72.62.162.83` (central CallSphere Postgres VM — one host, one logical DB per app)
+- **Logical DB**: `insight_healthcare` (new, isolated)
+- **Extensions**: `pgcrypto` (for `gen_random_uuid()`), `vector` (pgvector — semantic FAQ retrieval)
+- **Migrations**: Alembic, run from the `ai-service` container (`alembic upgrade head`)
+- **Credentials**: injected into the pod via k3s Secret `insight-app-secrets` (`secretKeyRef`) — never inline in YAML, per the CallSphere k3s pattern.
+
+### 8.1 ERD
+
+```mermaid
+erDiagram
+    clinic_settings {
+        smallint id PK "always 1"
+        text name
+        text address_line1
+        text city
+        text state
+        text postal_code
+        text phone
+        text email
+        text timezone
+        jsonb hours_json
+        text_array services_offered
+        timestamptz updated_at
+    }
+    providers {
+        uuid id PK
+        text name
+        text role
+        text email
+        text phone
+        boolean active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    appointment_slots {
+        uuid id PK
+        uuid provider_id FK
+        timestamptz start_at
+        timestamptz end_at
+        text status "available|booked|blocked"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    appointments {
+        uuid id PK
+        uuid slot_id FK "UNIQUE"
+        text patient_name
+        text patient_email
+        text patient_phone
+        text reason
+        text status "scheduled|completed|cancelled|no_show"
+        text cancellation_reason
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    insurance_plans {
+        uuid id PK
+        text payer_name
+        text plan_name
+        boolean accepted
+        text notes
+        date effective_from
+        date effective_to
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    clinic_faqs {
+        uuid id PK
+        text question
+        text answer
+        text_array tags
+        vector embedding "1536-d"
+        boolean active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    chat_sessions {
+        uuid id PK
+        text session_key "UK"
+        timestamptz started_at
+        timestamptz last_message_at
+        text user_agent
+        text ip_hash "sha256, never raw IP"
+        int message_count
+    }
+    chat_events {
+        bigserial id PK
+        uuid session_id FK
+        text agent_used "triage|appointment|insurance|knowledge|out_of_scope"
+        int latency_ms
+        int tokens_in
+        int tokens_out
+        int tool_calls_count
+        text error
+        timestamptz created_at
+    }
+
+    providers ||--o{ appointment_slots : "owns"
+    appointment_slots ||--o| appointments : "booked as (1:0..1)"
+    chat_sessions ||--o{ chat_events : "produces"
+```
+
+### 8.2 Table summary
+
+| Table | Purpose | Primary access pattern |
+|---|---|---|
+| `clinic_settings` | Single-row config: name, address, hours, services. CHECK (id = 1). | Read by Knowledge agent + frontend footer. |
+| `providers` | Doctors / practitioners taking appointments. | Read by Appointment agent. |
+| `appointment_slots` | Pre-generated bookable windows per provider. | List available (status='available' AND start_at>now); update on book. |
+| `appointments` | Confirmed bookings. `slot_id UNIQUE` prevents double-book at DB level. | Insert on confirm; read by future admin view. |
+| `insurance_plans` | Accepted (or explicitly not accepted) payers/plans + effective dates. | Case-insensitive lookup by payer_name. |
+| `clinic_faqs` | Knowledge base w/ 1536-d embeddings for semantic search. | `ORDER BY embedding <=> query_embedding LIMIT 5` from Knowledge agent. |
+| `chat_sessions` | Anonymous session tracking via cookie token. **No content.** | Upsert on each request. |
+| `chat_events` | Per-turn analytics. **No content stored.** | Insert on every agent reply; rollups by `created_at`. |
+
+### 8.3 Design notes
+
+- **No chat content stored** (per spec): `chat_events` keeps *which agent answered* + *latency* + *tokens*, but never `message.content`. Privacy-friendly for clinic context.
+- **Single-row `clinic_settings`** uses `CHECK (id = 1)` — gives one canonical config row without inventing a `clinics` table for a single-tenant app. If we ever go multi-clinic, this becomes a real `clinics` table and FKs get added everywhere.
+- **Slot model** keeps availability explicit and queryable; `appointments.slot_id UNIQUE` is the strongest guarantee against double-booking.
+- **pgvector**: FAQ embeddings are 1536-d (OpenAI `text-embedding-3-small`). Index: `ivfflat (embedding vector_cosine_ops)`. Embeddings are generated at admin write-time (`scripts/embed_faqs.py`), not at chat query-time — only the *query* gets embedded per request.
+- **Patient PII** is created only when a booking is confirmed. Anonymous browsing creates no patient row anywhere.
+- **`ip_hash`** stores SHA-256 of the client IP, never the raw IP — gives "unique visitors" analytics without storing identifiers.
+
+### 8.4 Indexes
+
+| Index | Purpose |
+|---|---|
+| `appointment_slots (status, start_at)` | "Next available slots" listing. |
+| `appointment_slots (provider_id, start_at)` | Per-provider schedule. |
+| `appointments (slot_id) UNIQUE` | Prevent double-book at DB layer. |
+| `insurance_plans (lower(payer_name))` | Case-insensitive payer match. |
+| `clinic_faqs USING ivfflat (embedding vector_cosine_ops)` | Semantic FAQ retrieval. |
+| `chat_events (session_id, created_at)` | Per-session timeline. |
+| `chat_events (created_at)` | Daily analytics rollups. |
+
+### 8.5 Migration plan (Alembic)
+
+| Revision | Contents |
+|---|---|
+| `001_init` | `CREATE EXTENSION pgcrypto, vector;` + all 8 tables + indexes |
+| `002_seed_clinic_settings` | Insert singleton row (placeholder name/address — overwrite via seed script) |
+| `003_seed_insurance_plans` | Common US payers (BCBS, Aetna, UnitedHealth, Cigna, Kaiser, Medicare) |
+| `004_seed_clinic_faqs` | ~20 starter FAQs (hours, parking, services, etc.) — embeddings filled by `scripts/embed_faqs.py` post-deploy |
+
+### 8.6 How the agents touch the DB
+
+| Agent | Reads | Writes |
+|---|---|---|
+| Triage | — | — (pure routing) |
+| Appointment | `providers`, `appointment_slots` | `appointments` (insert), `appointment_slots.status` (update to 'booked' / 'available' on cancel) |
+| Insurance | `insurance_plans` | — |
+| Knowledge | `clinic_settings`, `clinic_faqs` (vector search) | — |
+| *(chat_service)* | `chat_sessions` (upsert) | `chat_sessions`, `chat_events` (analytics) |
