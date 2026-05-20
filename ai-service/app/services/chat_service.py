@@ -84,6 +84,8 @@ def _count_tool_calls(new_items: Any) -> int:
     return count
 
 
+
+
 async def run_chat(
     session: AsyncSession,
     *,
@@ -109,26 +111,27 @@ async def run_chat(
     tool_calls = 0
 
     try:
-        # Build agent input from prior turns (if any) + this user message.
-        # First turn for a session passes a bare string; later turns pass the
-        # full conversation list so the head agent sees prior handoff context.
-        history = session_memory.get(session_key)
-        if history:
-            agent_input: Any = history + [{"role": "user", "content": message}]
-        else:
-            agent_input = message
-
-        result = await Runner.run(triage, input=agent_input)
+        # GPT-5 reasoning models need the full reasoning chain when replaying
+        # prior items via `input`. To avoid that fragility we use the SDK's
+        # response-chaining instead: pass the previous response_id and let
+        # OpenAI maintain conversation state server-side. Our memory just
+        # holds a short id string per session.
+        prev_response_id = session_memory.get(session_key)
+        result = await Runner.run(
+            triage,
+            input=message,
+            previous_response_id=prev_response_id,
+        )
         reply = result.final_output or ""
         last_agent_name = getattr(getattr(result, "last_agent", None), "name", None)
         agent_used = _classify_agent(last_agent_name, reply)
         tokens_in, tokens_out = _extract_usage(getattr(result, "raw_responses", None))
         tool_calls = _count_tool_calls(getattr(result, "new_items", None))
 
-        # Persist updated conversation in-memory for the next turn. Never let
-        # a memory failure break the user-facing reply.
+        # Persist the new last_response_id so the next turn can chain.
         try:
-            session_memory.put(session_key, result.to_input_list())
+            new_id = getattr(result, "last_response_id", None)
+            session_memory.put(session_key, new_id)
         except Exception as mem_exc:  # pragma: no cover
             logger.warning("session_memory.put failed: %s", mem_exc)
     except Exception as exc:

@@ -1,24 +1,32 @@
-"""In-process conversation memory keyed by session_key.
+"""In-process session memory keyed by session_key.
 
-The OpenAI Agents SDK is stateless per Runner.run call. To support
-multi-turn flows ("book one of those", "yes the 2pm slot", "my name is...")
-we keep the conversation in pod memory only — never persisted to Postgres
-(chat content storage is forbidden by spec). Pods are single-replica; if a
-pod restarts, all live sessions reset, which is acceptable.
+GPT-5 is a reasoning model. Its Responses API requires the full
+reasoning chain to be present whenever you replay prior items as
+`input` — every assistant message and every function_call must be
+paired with its preceding reasoning item, and those items are not
+easily round-trippable client-side.
+
+We sidestep all of that by using the SDK's `previous_response_id`
+mechanism: after each Runner.run, we keep the `result.last_response_id`
+and pass it back as `previous_response_id` on the next turn. OpenAI
+manages the conversation state on their side. We store nothing but a
+short string per active session.
+
+Pods are single-replica; if a pod restarts, all session ids reset and
+users start a fresh conversation, which is acceptable.
 """
 import threading
 import time
 from collections import OrderedDict
-from typing import Any
 
-_MAX_SESSIONS = 200          # LRU cap
-_TTL_SECONDS = 3600          # 1 hour idle eviction
-_MAX_ITEMS_PER_SESSION = 40  # last ~40 input-items (user/assistant/tool turns)
+_MAX_SESSIONS = 1000   # LRU cap (cheap — each entry is one short string)
+_TTL_SECONDS = 3600    # 1 hour idle eviction
 
 
 class _SessionMemory:
     def __init__(self) -> None:
-        self._store: OrderedDict[str, tuple[float, list[Any]]] = OrderedDict()
+        # session_key -> (last_access_monotonic, last_response_id)
+        self._store: OrderedDict[str, tuple[float, str]] = OrderedDict()
         self._lock = threading.Lock()
 
     def _evict_stale(self) -> None:
@@ -29,22 +37,25 @@ class _SessionMemory:
         while len(self._store) > _MAX_SESSIONS:
             self._store.popitem(last=False)
 
-    def get(self, session_key: str) -> list[Any] | None:
+    def get(self, session_key: str) -> str | None:
+        """Return the last_response_id for this session, or None if absent/stale."""
         with self._lock:
             self._evict_stale()
             item = self._store.get(session_key)
             if item is None:
                 return None
-            _ts, history = item
-            self._store[session_key] = (time.monotonic(), history)
+            _ts, response_id = item
+            self._store[session_key] = (time.monotonic(), response_id)
             self._store.move_to_end(session_key)
-            return list(history)
+            return response_id
 
-    def put(self, session_key: str, input_list: list[Any]) -> None:
+    def put(self, session_key: str, response_id: str | None) -> None:
+        """Persist the latest response_id for this session."""
+        if not response_id:
+            return
         with self._lock:
             self._evict_stale()
-            trimmed = list(input_list)[-_MAX_ITEMS_PER_SESSION:]
-            self._store[session_key] = (time.monotonic(), trimmed)
+            self._store[session_key] = (time.monotonic(), response_id)
             self._store.move_to_end(session_key)
 
     def clear(self, session_key: str) -> None:
