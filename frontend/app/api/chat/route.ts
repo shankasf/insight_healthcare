@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const UPSTREAM_TIMEOUT_MS = 30_000;
+const UPSTREAM_TIMEOUT_MS = 90_000;
 const MIN_MESSAGE_LEN = 1;
 const MAX_MESSAGE_LEN = 2000;
 // Loose UUID-ish check — covers crypto.randomUUID() output but stays permissive
