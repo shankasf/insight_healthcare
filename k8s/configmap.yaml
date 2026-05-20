@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: insight-config
+  namespace: insight-healthcare
+  labels:
+    app: insight-healthcare
+data:
+  # In-cluster URL for the AI service. The Next.js frontend's /api/chat
+  # route proxies to this address; the AI service is NOT exposed publicly.
+  AI_SERVICE_URL: "http://insight-ai.insight-healthcare.svc.cluster.local:8000"

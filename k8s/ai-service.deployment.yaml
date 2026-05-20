@@ -1,0 +1,71 @@
+# Insight Healthcare — AI Service (Python FastAPI + OpenAI Agents SDK)
+#
+# Image is a placeholder pointing at GHCR. Other CallSphere apps run code
+# directly off the host via a hostPath volume (no image build/push). To swap:
+#   1. Replace `image:` with a generic Python base (e.g. python:3.11-slim)
+#   2. Mount /home/ubuntu/apps/insight_healthcare/ai-service into /app
+#   3. Override `command:` to install deps + run `uvicorn app.main:app ...`
+# Either way, the env wiring below (secrets + configmap) is identical.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: insight-ai
+  namespace: insight-healthcare
+  labels:
+    app: insight-healthcare
+    component: ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: insight-healthcare
+      component: ai
+  template:
+    metadata:
+      labels:
+        app: insight-healthcare
+        component: ai
+    spec:
+      containers:
+        - name: insight-ai
+          image: ghcr.io/shankasf/insight-ai:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: insight-app-secrets
+                  key: OPENAI_API_KEY
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: insight-app-secrets
+                  key: DATABASE_URL
+            - name: MODEL_NAME
+              value: "gpt-5"
+            - name: EMBEDDING_MODEL
+              value: "text-embedding-3-small"
+            - name: CORS_ORIGINS
+              value: "https://clinic.callsphere.site"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"

@@ -1,0 +1,62 @@
+# Insight Healthcare — Frontend (Next.js, TypeScript, App Router)
+#
+# Image is a placeholder pointing at GHCR. Other CallSphere apps run code
+# directly off the host via a hostPath volume (no image build/push). To swap:
+#   1. Replace `image:` with node:20-alpine
+#   2. Mount /home/ubuntu/apps/insight_healthcare/frontend into /app
+#   3. Override `command:` to `npm install && npm run build && npm start`
+# Either way, the env wiring below (configmap-backed AI_SERVICE_URL) is the same.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: insight-frontend
+  namespace: insight-healthcare
+  labels:
+    app: insight-healthcare
+    component: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: insight-healthcare
+      component: frontend
+  template:
+    metadata:
+      labels:
+        app: insight-healthcare
+        component: frontend
+    spec:
+      containers:
+        - name: insight-frontend
+          image: ghcr.io/shankasf/insight-frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: AI_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: insight-config
+                  key: AI_SERVICE_URL
+            - name: NODE_ENV
+              value: "production"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

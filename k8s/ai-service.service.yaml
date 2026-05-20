@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: insight-ai
+  namespace: insight-healthcare
+  labels:
+    app: insight-healthcare
+    component: ai
+spec:
+  type: ClusterIP
+  selector:
+    app: insight-healthcare
+    component: ai
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
