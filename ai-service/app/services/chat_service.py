@@ -9,6 +9,7 @@ from app.agents.triage import build_triage_agent
 from app.core.logging import get_logger
 from app.repositories import chat_repo
 from app.schemas.chat import AgentName
+from app.services.session_memory import memory as session_memory
 
 logger = get_logger(__name__)
 
@@ -108,12 +109,28 @@ async def run_chat(
     tool_calls = 0
 
     try:
-        result = await Runner.run(triage, input=message)
+        # Build agent input from prior turns (if any) + this user message.
+        # First turn for a session passes a bare string; later turns pass the
+        # full conversation list so the head agent sees prior handoff context.
+        history = session_memory.get(session_key)
+        if history:
+            agent_input: Any = history + [{"role": "user", "content": message}]
+        else:
+            agent_input = message
+
+        result = await Runner.run(triage, input=agent_input)
         reply = result.final_output or ""
         last_agent_name = getattr(getattr(result, "last_agent", None), "name", None)
         agent_used = _classify_agent(last_agent_name, reply)
         tokens_in, tokens_out = _extract_usage(getattr(result, "raw_responses", None))
         tool_calls = _count_tool_calls(getattr(result, "new_items", None))
+
+        # Persist updated conversation in-memory for the next turn. Never let
+        # a memory failure break the user-facing reply.
+        try:
+            session_memory.put(session_key, result.to_input_list())
+        except Exception as mem_exc:  # pragma: no cover
+            logger.warning("session_memory.put failed: %s", mem_exc)
     except Exception as exc:
         logger.exception("Runner.run failed")
         error = str(exc)[:500]
